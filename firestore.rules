@@ -1,0 +1,170 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: /schemes/{schemeId}
+    // Document ID: string (e.g., 'pm-kisan', 'ayushman-bharat-pmjay')
+    // Description: Official government welfare schemes repository
+    // Access: Public read access for citizen welfare lookup.
+    //         Write/Create/Update/Delete strictly forbidden from client SDKs.
+    //         Managed exclusively via backend admin environments.
+    // Fields:
+    //   - id: string (required) - Scheme identifier
+    //   - name: string (required) - Scheme title
+    //   - shortDescription: string (required) - Summary
+    //   - detailedOverview: string (required) - In-depth description
+    //   - benefits: string (required) - Direct welfare benefits
+    //   - eligibility: string (required) - Criteria & conditions
+    //   - documents: string (required) - Required identity & proof docs
+    //   - applicationProcess: string (required) - Application instructions
+    //   - classification: string (required) - 'Central' or 'State'
+    //   - state: string (optional) - State name if State-level
+    //   - category: string (required) - Category (e.g. Agriculture, Healthcare)
+    //   - officialUrl: string (required) - Official portal web address
+    //   - applicationUrl: string (optional) - Direct application URL
+    //   - source: string (required) - Government portal source
+    //   - lastVerified: string (required) - ISO verification timestamp
+    //   - verificationStatus: string (required) - 'verified' | 'unverified' | 'sample'
+    //
+    // Collection: /users/{userId}
+    // Document ID: Firebase Auth UID matching the authenticated citizen
+    // Description: Citizen user profile and preferences
+    // Access: Read and update allowed ONLY if request.auth != null and request.auth.uid == userId.
+    //         Client creates and deletes denied by default (provisioned via backend triggers).
+    // Fields:
+    //   - uid: string (optional, immutable, must match request.auth.uid)
+    //   - email: string (optional, max 254 chars, valid email format)
+    //   - displayName: string (optional, 1-100 chars)
+    //   - photoURL: string (optional, max 2000 chars, valid URL)
+    //   - phoneNumber: string (optional, max 20 chars)
+    //   - state: string (optional, max 50 chars)
+    //   - language: string (optional, max 10 chars)
+    //   - role: string (optional, 'citizen' | 'user', immutable on update)
+    //   - createdAt: timestamp (optional, immutable)
+    //   - updatedAt: timestamp (optional)
+    //
+    // Collection: /users/{userId}/favorites/{schemeId}
+    // Document ID: Scheme ID slug matching the bookmarked scheme
+    // Description: Citizen's bookmarked schemes for quick access
+    // Access: Read, create, update, delete allowed ONLY if request.auth != null and request.auth.uid == userId.
+    // Fields:
+    //   - schemeId: string (required, 1-100 chars, must match document ID)
+    //   - savedAt: timestamp (required, record timestamp)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if user is authenticated with Firebase Auth
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the document / path by UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+             email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    // Validate web URL format
+    function isValidUrl(url) {
+      return url is string &&
+             (url.matches('^https://.*') || url.matches('^http://.*'));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // Validate favorite document schema and constraints
+    function isValidFavorite(schemeId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['schemeId', 'savedAt']) &&
+             data.keys().hasAll(['schemeId', 'savedAt']) &&
+             data.schemeId is string &&
+             data.schemeId.size() > 0 &&
+             data.schemeId.size() <= 100 &&
+             data.schemeId == schemeId &&
+             data.savedAt is timestamp;
+    }
+
+    // Validate user profile schema and data boundaries
+    function isValidUserProfile() {
+      let data = request.resource.data;
+      let allowedFields = [
+        'uid', 'email', 'displayName', 'photoURL', 'phoneNumber',
+        'createdAt', 'updatedAt', 'role', 'state', 'language'
+      ];
+      return data.keys().hasOnly(allowedFields) &&
+             (!('uid' in data) || (data.uid is string && data.uid == request.auth.uid)) &&
+             (!('email' in data) || (data.email is string && isValidEmail(data.email) && data.email.size() <= 254)) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100)) &&
+             (!('photoURL' in data) || (data.photoURL is string && isValidUrl(data.photoURL) && data.photoURL.size() <= 2000)) &&
+             (!('phoneNumber' in data) || (data.phoneNumber is string && data.phoneNumber.size() <= 20)) &&
+             (!('state' in data) || (data.state is string && data.state.size() <= 50)) &&
+             (!('language' in data) || (data.language is string && data.language.size() <= 10)) &&
+             (!('role' in data) || (data.role is string && data.role in ['citizen', 'user'])) &&
+             (!('createdAt' in data) || data.createdAt is timestamp) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+
+    // Validate profile update operations: ensures schema integrity, prevents
+    // privilege escalation, and enforces immutability of system fields.
+    function isValidUserUpdate() {
+      let data = request.resource.data;
+      let prev = resource.data;
+      return isValidUserProfile() &&
+             (!('uid' in prev) || ('uid' in data && data.uid == prev.uid)) &&
+             (!('createdAt' in prev) || ('createdAt' in data && data.createdAt == prev.createdAt)) &&
+             (!('role' in prev) || ('role' in data && data.role == prev.role));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    // 1. Schemes Collection:
+    // Public read access for all citizens and unauthenticated visitors.
+    // Client writes/creates/updates/deletes are strictly forbidden.
+    match /schemes/{schemeId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // 2. Users Collection and Subcollections:
+    match /users/{userId} {
+      // Citizen profile: allowed read and update ONLY by the document owner.
+      // Client create and delete are denied by default.
+      allow read: if isOwner(userId);
+      allow update: if isOwner(userId) && isValidUserUpdate();
+      allow create, delete: if false;
+
+      // 3. User Favorites Subcollection:
+      // Bookmarked schemes: strictly scoped to the authenticated owner.
+      match /favorites/{schemeId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidFavorite(schemeId);
+        allow update: if isOwner(userId) && isValidFavorite(schemeId);
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // 4. Default Deny:
+    // All other collections and paths are explicitly closed to read and write.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
